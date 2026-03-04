@@ -220,6 +220,7 @@ function MonarchFieldApp() {
   const [overlayName,   setOverlayName]   = useState("");
   const [showOverlayPanel, setShowOverlayPanel] = useState(false);
   const [gpsStatus, setGpsStatus] = useState("idle");
+  const [apnStatus, setApnStatus] = useState("idle"); // idle | lookup | found
   const [camActive, setCamActive]     = useState(false);
   const [photoMode, setPhotoMode]     = useState("auto");
   const [photoIndexManual, setPhotoIndexManual] = useState("");
@@ -247,16 +248,15 @@ function MonarchFieldApp() {
         setGpsStatus("ok");
         setTimeout(() => setGpsStatus("idle"), 3000);
 
-        // ── Reverse geocode → auto-fill address ──────────────────────
+        // ── Reverse geocode → auto-fill address (Nominatim) ────────
         try {
-          const res = await fetch(
+          const nomRes = await fetch(
             `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&addressdetails=1`,
             { headers: { "Accept-Language": "en-US,en", "User-Agent": "ArborFieldPro/3.0" } }
           );
-          const data = await res.json();
-          if (data && data.address) {
-            const a = data.address;
-            // Build a clean US street address
+          const nomData = await nomRes.json();
+          if (nomData && nomData.address) {
+            const a = nomData.address;
             const num    = a.house_number || "";
             const street = a.road || a.pedestrian || a.footway || "";
             const city   = a.city || a.town || a.village || a.hamlet || a.county || "";
@@ -273,8 +273,102 @@ function MonarchFieldApp() {
             }
           }
         } catch(e) {
-          // Reverse geocode failed silently — address remains editable
-          console.warn("Reverse geocode failed:", e);
+          console.warn("Address reverse geocode failed:", e);
+        }
+
+        // ── APN lookup → county parcel GIS services ───────────────────
+        // Tries SLO County first, then Santa Barbara County.
+        // Both use public ArcGIS REST endpoints — no API key required.
+        const apnQuery = (baseUrl) => {
+          const params = new URLSearchParams({
+            geometry:       `${lng},${lat}`,
+            geometryType:   "esriGeometryPoint",
+            spatialRel:     "esriSpatialRelIntersects",
+            inSR:           "4326",
+            outFields:      "*",
+            returnGeometry: "false",
+            f:              "json"
+          });
+          return fetch(`${baseUrl}?${params}`, {
+            headers: { "User-Agent": "ArborFieldPro/3.0" }
+          }).then(r => r.json());
+        };
+
+        // Known public parcel services — SLO and SB counties
+        const parcelServices = [
+          // SLO County — primary
+          {
+            county: "SLO",
+            url: "https://services1.arcgis.com/IjOQ47IxPGP8LRXT/arcgis/rest/services/SLO_Parcels/FeatureServer/0/query",
+            apnField: ["APN","Apn","apn","PARCEL_NO","ParcelNumber","APN_LABEL"]
+          },
+          // SLO County — alternate service
+          {
+            county: "SLO",
+            url: "https://gis.slocounty.ca.gov/arcgis/rest/services/Parcels/MapServer/0/query",
+            apnField: ["APN","Apn","apn","PARCEL_NO"]
+          },
+          // Santa Barbara County
+          {
+            county: "SB",
+            url: "https://services.arcgis.com/VjPFBM6x8UoCDYMh/arcgis/rest/services/SB_Parcels/FeatureServer/0/query",
+            apnField: ["APN","Apn","apn","PARCELNO","PARCEL_ID"]
+          },
+          // SB County — alternate
+          {
+            county: "SB",
+            url: "https://gis.countyofsb.org/arcgis/rest/services/assessor/MapServer/0/query",
+            apnField: ["APN","Apn","apn","PARCELNO"]
+          }
+        ];
+
+        let apnFound = false;
+        for (const svc of parcelServices) {
+          if (apnFound) break;
+          try {
+            const pData = await apnQuery(svc.url);
+            if (pData && pData.features && pData.features.length > 0) {
+              const attrs = pData.features[0].attributes || {};
+              // Try each possible APN field name
+              for (const field of svc.apnField) {
+                if (attrs[field]) {
+                  const rawApn = String(attrs[field]).trim();
+                  // Format SLO-style APN: 9 digits → NNN-NNN-NNN
+                  const digits = rawApn.replace(/\D/g,"");
+                  const formatted = digits.length === 9
+                    ? `${digits.slice(0,3)}-${digits.slice(3,6)}-${digits.slice(6)}`
+                    : rawApn;
+                  setTree(t => ({ ...t, apn: t.apn || formatted }));
+                  apnFound = true;
+                  console.log(`APN found via ${svc.county} parcel service: ${formatted}`);
+                  break;
+                }
+              }
+              // Also try to extract address from parcel if Nominatim missed it
+              if (!apnFound) {
+                const addrField = attrs["SitusAddress"] || attrs["SITUS_ADDRESS"] ||
+                                  attrs["Address"] || attrs["SITE_ADDR"] || "";
+                const cityField = attrs["SitusCity"] || attrs["CITY"] || "";
+                const zipField  = attrs["SitusZip"]  || attrs["ZIP"]  || "";
+                if (addrField) {
+                  const parcelAddr = [addrField, cityField, zipField]
+                    .filter(Boolean).join(", ");
+                  setTree(t => ({ ...t, address: t.address || parcelAddr }));
+                }
+              }
+            }
+          } catch(e) {
+            console.warn(`Parcel service ${svc.county} failed:`, e.message);
+          }
+        }
+
+        // If no APN found from GIS services, set a lookup-ready placeholder
+        // so the field clearly shows it needs manual entry
+        if (!apnFound) {
+          setApnStatus("lookup");
+        } else {
+          setApnStatus("found");
+          setTimeout(() => setApnStatus("idle"), 4000);
         }
       },
       err => {
@@ -799,8 +893,30 @@ function MonarchFieldApp() {
                 <input style={inp} value={tree.address} onChange={e=>update("address",e.target.value)} placeholder="e.g. 1234 Trilogy Pkwy, Nipomo CA 93444"/>
               </div>
               <div style={fld}>
-                <label style={lbl}>APN — Assessor's Parcel Number</label>
-                <input style={inp} value={tree.apn} onChange={e=>update("apn",e.target.value)} placeholder="e.g. 091-480-012" inputMode="numeric"/>
+                <label style={lbl}>APN — Assessor's Parcel Number
+                    {apnStatus==="found"&&<span style={{fontSize:9,color:"#7EC850",fontStyle:"italic",fontWeight:400,marginLeft:4}}>✅ auto-filled</span>}
+                    {apnStatus==="lookup"&&<span style={{fontSize:9,color:"#f59e0b",fontStyle:"italic",fontWeight:400,marginLeft:4}}>⚠️ not found — enter manually</span>}
+                  </label>
+                <input
+                  style={{...inp, borderColor:apnStatus==="found"?"#7EC850":apnStatus==="lookup"?"#f59e0b":undefined}}
+                  value={tree.apn}
+                  onChange={e=>{ update("apn",e.target.value); setApnStatus("idle"); }}
+                  placeholder="e.g. 091-480-012"
+                  inputMode="numeric"/>
+                {apnStatus==="lookup"&&tree.lat&&tree.lng&&(
+                  <div style={{marginTop:5,display:"flex",gap:5,flexWrap:"wrap",alignItems:"center"}}>
+                    <span style={{fontSize:9,color:T.textDim}}>Look up manually:</span>
+                    <a href="https://www.slocounty.ca.gov/departments/assessor-recorder-county-clerk/assessor/property-information-search.aspx"
+                      target="_blank" rel="noreferrer"
+                      style={{fontSize:9,color:"#7EC850",border:"1px solid #3A6B1A",borderRadius:3,padding:"2px 7px",textDecoration:"none",fontWeight:700}}>SLO County ↗</a>
+                    <a href="https://www.countyofsb.org/assessor/"
+                      target="_blank" rel="noreferrer"
+                      style={{fontSize:9,color:"#7EC850",border:"1px solid #3A6B1A",borderRadius:3,padding:"2px 7px",textDecoration:"none",fontWeight:700}}>SB County ↗</a>
+                    <a href="https://maps.slocounty.ca.gov/Html5Viewer/?viewer=SLOMapViewer"
+                      target="_blank" rel="noreferrer"
+                      style={{fontSize:9,color:"#6B8C2A",border:"1px solid #2D5A1B",borderRadius:3,padding:"2px 7px",textDecoration:"none",fontWeight:700}}>SLO GIS ↗</a>
+                  </div>
+                )}
                 <div style={{fontSize:9,color:T.textDim,marginTop:3}}>SLO County format: NNN-NNN-NNN · Look up at slocounty.ca.gov/assessor</div>
               </div>
             </div>
